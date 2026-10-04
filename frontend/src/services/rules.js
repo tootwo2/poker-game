@@ -6,6 +6,10 @@ export function canStart(table) {
   return ['WAITING', 'SHOWDOWN'].includes(table.phase) && table.players.length >= 2
 }
 
+export function waitingForNextHand(table, player) {
+  return !!table && !['WAITING', 'SHOWDOWN'].includes(table.phase) && player?.status === 'SITTING'
+}
+
 export function minimumRaiseTo(table) {
   return table.currentBet + table.minRaise
 }
@@ -34,10 +38,4 @@ export function quickRaiseTo(table, player, fraction) {
   return Math.min(maximum, Math.max(minimum, target))
 }
 
-export function canAutoStartNextHand(table, player) {
-  if (!table?.privateTable || table.phase !== 'SHOWDOWN' || !player) return false
-  if ((player.chips || 0) < (table.minBuyIn || 0)) return false
-  return table.players.some(other => other.id !== player.id
-    && ((other.chips || 0) > 0 || (other.ai && (other.reserveChips || 0) > 0)))
-}
 

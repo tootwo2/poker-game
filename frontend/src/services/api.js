@@ -39,6 +39,12 @@ export const api = {
   reconnect: (tableId, playerId, reconnectToken) => request(`/api/tables/${tableId}/reconnect`, {
     method: 'POST', headers: jsonHeaders, body: JSON.stringify({ playerId, reconnectToken })
   }),
+  renameTable: (tableId, playerId, reconnectToken, tableName) => request(`/api/tables/${tableId}/name`, {
+    method: 'POST', headers: jsonHeaders, body: JSON.stringify({ playerId, reconnectToken, tableName })
+  }),
+  leaveTable: (tableId, playerId, reconnectToken) => request(`/api/tables/${tableId}/leave`, {
+    method: 'POST', headers: jsonHeaders, body: JSON.stringify({ playerId, reconnectToken })
+  }),
   getTable: (tableId, playerId, reconnectToken) => request(`/api/tables/${tableId}?${new URLSearchParams({ playerId, reconnectToken })}`),
   advice: (tableId, playerId, reconnectToken) => request(`/api/tables/${tableId}/advice?${new URLSearchParams({ playerId, reconnectToken })}`),
   start: (tableId, playerId, reconnectToken) => request(`/api/tables/${tableId}/start`, {

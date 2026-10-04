@@ -31,6 +31,8 @@ public final class Requests {
                             UUID accountToken,
                             @Min(1) @Max(10_000_000) Integer buyIn) {}
     public record PlayerCommand(@NotNull UUID playerId, @NotNull UUID reconnectToken) {}
+    public record RenameTable(@NotNull UUID playerId, @NotNull UUID reconnectToken,
+                              @NotBlank @Size(max = 30) String tableName) {}
     public record ChipCommand(@NotNull UUID playerId, @NotNull UUID reconnectToken,
                               @Min(1) @Max(10_000_000) int amount) {}
     public record EmoteCommand(@NotNull UUID playerId, @NotNull UUID reconnectToken,

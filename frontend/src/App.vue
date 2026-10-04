@@ -32,6 +32,7 @@ const error = ref('')
 const connected = ref(false)
 const emoteEvent = ref(null)
 const savedSession = ref(readPokerSession())
+const advancedSettings = ref(null)
 const adminOpen = ref(false)
 const adminToken = ref(sessionStorage.getItem('poker.adminToken') || '')
 const adminAuthenticated = ref(false)
@@ -274,15 +275,34 @@ async function resumeSession(silent = false) {
 }
 
 async function createTable() {
-  if (!nickname.value.trim() || !tableName.value.trim()) return
+  const name = tableName.value.trim()
+  if (!nickname.value.trim()) {
+    error.value = '请先输入昵称'
+    return
+  }
+  if (!name) {
+    error.value = '请填写牌桌名称'
+    if (advancedSettings.value) advancedSettings.value.open = true
+    return
+  }
+  tableName.value = name
   const account = await ensureAccount()
   if (!account) return
   if (await restoreAccountSeat(true)) {
+    if (table.value?.name !== name) {
+      const renamed = await run(() => api.renameTable(table.value.id, playerId.value,
+        reconnectToken.value, name))
+      if (renamed) {
+        table.value = renamed
+        savedSession.value = savePokerSession({ ...savedSession.value, tableName: renamed.name })
+      }
+      return
+    }
     error.value = '已恢复该账号保留的牌局'
     return
   }
   const session = await run(() => api.createTable({
-    tableName: tableName.value,
+    tableName: name,
     nickname: nickname.value,
     accountId: account.accountId,
     accountToken: account.accountToken,
@@ -366,6 +386,27 @@ function leave() {
     savedSession.value = savePokerSession({ ...savedSession.value, autoResume: false })
   }
   table.value = null; advice.value = null; playerId.value = ''; reconnectToken.value = ''; loadTables()
+}
+
+async function exitTable() {
+  const inHand = !['WAITING', 'SHOWDOWN'].includes(table.value.phase)
+  const message = inHand
+    ? '离开会弃掉本局，已下注的筹码留在底池，剩余筹码退回账号，座位不再保留。确定离开吗？'
+    : '离开后座位取消，桌上和备用筹码退回账号。确定离开吗？'
+  if (!window.confirm(message)) return
+  const left = await run(() => api.leaveTable(table.value.id, playerId.value, reconnectToken.value))
+  if (left === undefined) return
+  stopSocket?.()
+  stopSocket = null
+  connected.value = false
+  clearPokerSession()
+  savedSession.value = null
+  table.value = null
+  advice.value = null
+  playerId.value = ''
+  reconnectToken.value = ''
+  await loadTables()
+  await loadAccountProfile(true)
 }
 
 async function adjustChips(type, amount) {
@@ -462,7 +503,7 @@ onBeforeUnmount(() => stopSocket?.())
 <template>
   <PokerRoom v-if="table" :table="table" :player-id="playerId" :advice="advice"
     :busy="busy" :connected="connected" :emote-event="emoteEvent"
-    @action="action" @chips="adjustChips" @start="start" @emote="sendEmote" @leave="leave" />
+    @action="action" @chips="adjustChips" @start="start" @emote="sendEmote" @leave="leave" @exit="exitTable" />
   <main v-else class="lobby-shell">
     <nav class="brand">
       <div class="brand-lockup">
@@ -512,10 +553,12 @@ onBeforeUnmount(() => stopSocket?.())
           <label>人数<select v-model.number="maxPlayers"><option v-for="n in [2,3,4,5,6]" :key="n" :value="n">{{ n }} 人桌</option></select></label>
           <label>带入筹码<input v-model.number="buyIn" type="number" :min="tableSettings.minBuyIn" :max="tableSettings.maxBuyIn" :step="tableSettings.bigBlind" required /></label>
         </div>
-        <details class="create-advanced">
-          <summary><span>更多设置</span><small>牌桌名称、AI 数量与金额说明</small></summary>
-          <div class="create-advanced-body">
-            <label>牌桌名称<input v-model="tableName" maxlength="30" required /></label>
+        <details ref="advancedSettings" class="create-advanced">
+          <summary>
+            <span class="create-advanced-summary"><span>更多设置</span><small>牌桌名称、AI 数量与金额说明</small></span>
+          </summary>
+          <div class="create-advanced-body" @click.stop>
+            <label><span>牌桌名称</span><input v-model="tableName" maxlength="30" autocomplete="off" /></label>
             <label v-if="privateTable">AI 选手数量<select v-model.number="aiPlayers"><option v-for="n in maxPlayers - 1" :key="n" :value="n">{{ n }} 位 AI</option></select></label>
             <p>允许带入 {{ tableSettings.minBuyIn }}–{{ tableSettings.maxBuyIn }}，本次总额度 {{ tableSettings.totalChips }}。</p>
           </div>
@@ -531,7 +574,7 @@ onBeforeUnmount(() => stopSocket?.())
           <div class="table-identity"><span class="table-monogram">R</span><span><strong>{{ item.name }}</strong><small><i class="phase-dot" :class="{ waiting: item.phase === 'WAITING' || item.phase === 'SHOWDOWN' }"></i>{{ item.phaseLabel }}</small></span></div>
           <span class="table-stakes"><strong>{{ item.smallBlind }}/{{ item.bigBlind }} · {{ item.playerCount }}/{{ item.maxPlayers }} 人</strong><small>总额度 {{ item.totalChips }}</small></span>
           <label class="row-buy-in">带入<input v-model.number="joinBuyIns[item.id]" type="number" :min="item.minBuyIn" :max="item.maxBuyIn" :step="item.bigBlind" :title="`允许 ${item.minBuyIn}–${item.maxBuyIn}`" /></label>
-          <button :disabled="busy || item.playerCount >= item.maxPlayers || !['WAITING','SHOWDOWN'].includes(item.phase)" @click="join(item)">入座 <span aria-hidden="true">→</span></button>
+          <button :disabled="busy || item.playerCount >= item.maxPlayers" :title="['WAITING','SHOWDOWN'].includes(item.phase) ? undefined : '本局旁观，下一局开始发牌'" @click="join(item)">入座 <span aria-hidden="true">→</span></button>
         </article>
       </div>
       <div v-else class="empty-lobby"><span>♠</span><strong>今晚的第一张牌桌，等你开局</strong><small>完成上方设置后即可立即入座</small></div>

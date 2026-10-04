@@ -3,8 +3,8 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import PlayingCard from './PlayingCard.vue'
 import { createPokerAudio, readAudioPreferences, saveAudioPreferences, VOICE_EMOTES } from '../services/audio'
 import { canTopUpAmount, suggestedTopUp } from '../services/chips'
-import { callAmount as getCallAmount, canAllIn, canAutoStartNextHand, canStart as getCanStart,
-  minimumRaiseTo, quickRaiseTo, validRaise } from '../services/rules'
+import { callAmount as getCallAmount, canAllIn, canStart as getCanStart,
+  minimumRaiseTo, quickRaiseTo, validRaise, waitingForNextHand } from '../services/rules'
 import { boardMotion, collectBetFlights, turnClock, winningCardState } from '../services/tableEffects'
 import { seatsFromViewer } from '../services/tableView'
 
@@ -16,13 +16,11 @@ const props = defineProps({
   connected: Boolean,
   emoteEvent: Object
 })
-const emit = defineEmits(['action', 'chips', 'start', 'emote', 'leave'])
+const emit = defineEmits(['action', 'chips', 'start', 'emote', 'leave', 'exit'])
 const savedAudio = readAudioPreferences()
 const pokerAudio = createPokerAudio()
 const raiseTo = ref(40)
 const chipAmount = ref(100)
-const autoNext = ref(localStorage.getItem('poker.autoNext') !== 'false')
-const autoCountdown = ref(0)
 const strategyExpanded = ref(false)
 const customRaiseExpanded = ref(false)
 const chipManagerOpen = ref(false)
@@ -36,7 +34,6 @@ const musicStatus = ref(savedAudio.musicEnabled ? '点击页面后开始播放' 
 const activeEmote = ref(null)
 const actionNow = ref(Date.now())
 const chipFlights = ref([])
-let autoTimer
 let emoteTimer
 let clockTimer
 let flightSequence = 0
@@ -54,6 +51,12 @@ const canRaise = computed(() => validRaise(props.table, me.value, Number(raiseTo
 const allInAllowed = computed(() => canAllIn(props.table, me.value))
 const seats = computed(() => seatsFromViewer(props.table.players, props.table.maxPlayers, props.playerId))
 const betweenHands = computed(() => ['WAITING', 'SHOWDOWN'].includes(props.table.phase))
+const waitingNextHand = computed(() => waitingForNextHand(props.table, me.value))
+const nextHandSeconds = computed(() => {
+  const deadline = props.table.nextHandDeadline || 0
+  if (!deadline) return 0
+  return Math.max(0, Math.ceil((deadline - actionNow.value) / 1000))
+})
 const transferAmount = computed(() => Number(chipAmount.value) || 0)
 const canTopUp = computed(() => canTopUpAmount(props.table, me.value, transferAmount.value))
 const canCashOut = computed(() => {
@@ -61,7 +64,6 @@ const canCashOut = computed(() => {
   return transferAmount.value > 0 && remaining >= 0
     && (remaining === 0 || remaining >= props.table.minBuyIn)
 })
-const autoNextEligible = computed(() => canAutoStartNextHand(props.table, me.value))
 const actionClock = computed(() => turnClock(
   props.table.actionDeadline,
   props.table.actionTimeSeconds,
@@ -128,18 +130,6 @@ watch([
   const suggestion = suggestedTopUp(props.table, me.value)
   if (suggestion > 0) chipAmount.value = suggestion
 }, { immediate: true })
-watch([autoNextEligible, autoNext, () => props.busy], ([eligible, enabled, busy]) => {
-  clearAutoTimer()
-  if (!eligible || !enabled || busy) return
-  autoCountdown.value = 3
-  autoTimer = window.setInterval(() => {
-    autoCountdown.value--
-    if (autoCountdown.value <= 0) {
-      clearAutoTimer()
-      emit('start')
-    }
-  }, 1000)
-}, { immediate: true })
 watch(myTurn, value => {
   if (value && effectsEnabled.value && navigator.vibrate) navigator.vibrate(70)
   if (!value) customRaiseExpanded.value = false
@@ -174,18 +164,7 @@ function quickRaise(amount) {
 }
 
 function startHand() {
-  clearAutoTimer()
   emit('start')
-}
-
-function clearAutoTimer() {
-  if (autoTimer) window.clearInterval(autoTimer)
-  autoTimer = null
-  autoCountdown.value = 0
-}
-
-function toggleAutoNext() {
-  localStorage.setItem('poker.autoNext', String(autoNext.value))
 }
 
 function saveSoundSettings() {
@@ -289,7 +268,6 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
-  clearAutoTimer()
   if (emoteTimer) window.clearTimeout(emoteTimer)
   if (clockTimer) window.clearInterval(clockTimer)
   flightTimers.forEach(timer => window.clearTimeout(timer))
@@ -318,6 +296,9 @@ onBeforeUnmount(() => {
         <div class="connection" :class="{ online: connected }">
           <span></span>{{ connected ? '实时在线' : '正在重连' }}
         </div>
+        <button class="leave-table-button" type="button" :disabled="busy" aria-label="彻底离开牌桌" @click="emit('exit')">
+          <span aria-hidden="true">✕</span><b>离开</b>
+        </button>
         <button class="sound-settings-button" type="button" :class="{ active: musicEnabled || voiceEnabled || effectsEnabled }"
           :aria-expanded="soundPanelOpen" aria-label="声音设置" @click="toggleSoundPanel"><span aria-hidden="true">♫</span><b>声音</b></button>
       </div>
@@ -414,6 +395,7 @@ onBeforeUnmount(() => {
               <span v-if="seat.player.ai" class="ai-badge">AI</span>
               <span v-if="seat.player.winner" class="winner-badge">🏆 胜者</span>
               <strong class="player-name">{{ seat.player.nickname }}</strong>
+              <small v-if="seat.player.status === 'SITTING' && !betweenHands" class="waiting-next">下一局</small>
               <small class="player-stack" :title="`桌外备用 ${seat.player.reserveChips}`"><span aria-hidden="true">◉</span>{{ seat.player.chips }}</small>
             </div>
             <span v-if="seat.player.streetBet" class="bet-chip">{{ seat.player.streetBet }}</span>
@@ -454,7 +436,9 @@ onBeforeUnmount(() => {
         <span class="status-kicker">{{ myTurn ? 'YOUR ACTION' : betweenHands ? 'TABLE STATUS' : 'LIVE ACTION' }}</span>
         <p>{{ table.message }}</p>
         <small v-if="myTurn">轮到你了 · 跟注额 {{ callAmount }}</small>
+        <small v-else-if="waitingNextHand">本局旁观，下一局开始发牌</small>
         <small v-else-if="!canStart">等待其他玩家行动</small>
+        <small v-else-if="nextHandSeconds">{{ nextHandSeconds }} 秒后自动开始下一局</small>
         <small v-else>至少两人即可开始下一局</small>
       </div>
       <div v-if="myTurn" class="actions" aria-label="牌局操作">
@@ -472,9 +456,7 @@ onBeforeUnmount(() => {
         </template>
       </div>
       <div v-else-if="canStart" class="next-hand-controls">
-        <button class="gold start-button" :disabled="busy" @click="startHand">{{ autoCountdown ? `${autoCountdown} 秒后自动下一局` : '开始下一局' }}</button>
-        <button v-if="autoCountdown" class="cancel-countdown" type="button" @click="clearAutoTimer">取消倒计时</button>
-        <label v-if="table.privateTable" class="auto-next-toggle"><input v-model="autoNext" type="checkbox" @change="toggleAutoNext" /><span>自动下一局</span></label>
+        <button class="gold start-button" :disabled="busy" @click="startHand">{{ nextHandSeconds ? `${nextHandSeconds} 秒后自动下一局` : '开始下一局' }}</button>
       </div>
     </section>
     <aside class="voice-emote-dock" :class="{ expanded: voiceTrayOpen }">

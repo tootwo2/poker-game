@@ -7,11 +7,13 @@ import com.example.poker.domain.PlayerStatus;
 import com.example.poker.domain.PokerTable;
 import com.example.poker.dto.TableViews;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.annotation.PreDestroy;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.stereotype.Service;
 
 import java.security.SecureRandom;
+import java.time.Instant;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -20,6 +22,9 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 @Service
@@ -34,30 +39,62 @@ public class TableService {
             "cheers", "干得漂亮"
     );
     private static final long EMOTE_COOLDOWN_NANOS = 1_200_000_000L;
+    private static final long NEXT_HAND_DELAY_MILLIS = 4_000L;
 
     private final ConcurrentMap<UUID, PokerTable> tables = new ConcurrentHashMap<>();
     private final ConcurrentMap<UUID, AtomicLong> versions = new ConcurrentHashMap<>();
     private final ConcurrentMap<UUID, Long> lastEmotes = new ConcurrentHashMap<>();
+    private final ConcurrentMap<UUID, Long> nextHandTokens = new ConcurrentHashMap<>();
+    private final ConcurrentMap<UUID, Runnable> pendingNextHands = new ConcurrentHashMap<>();
     private final SimpMessagingTemplate messaging;
     private final PokerSettings settings;
     private final AccountService accounts;
+    private final ScheduledExecutorService nextHandExecutor;
+    private final long nextHandDelayMillis;
     private final PokerAiStrategy aiStrategy = new PokerAiStrategy(new SecureRandom(), 260);
     private final PokerAdvisor advisor = new PokerAdvisor();
 
     @Autowired
     public TableService(SimpMessagingTemplate messaging, PokerSettings settings, AccountService accounts) {
-        this.messaging = messaging;
-        this.settings = settings;
-        this.accounts = accounts;
+        this(messaging, settings, accounts, daemonNextHandExecutor(), NEXT_HAND_DELAY_MILLIS);
     }
 
     TableService(SimpMessagingTemplate messaging) {
-        this(messaging, testSettings());
+        this(messaging, testSettings(), null, NEXT_HAND_DELAY_MILLIS);
     }
 
-    private TableService(SimpMessagingTemplate messaging, PokerSettings settings) {
+    TableService(SimpMessagingTemplate messaging, ScheduledExecutorService nextHandExecutor, long nextHandDelayMillis) {
+        this(messaging, testSettings(), nextHandExecutor, nextHandDelayMillis);
+    }
+
+    private TableService(SimpMessagingTemplate messaging, PokerSettings settings,
+                         ScheduledExecutorService nextHandExecutor, long nextHandDelayMillis) {
         this(messaging, settings, new AccountService(
-                new ObjectMapper().findAndRegisterModules(), settings, (java.nio.file.Path) null));
+                new ObjectMapper().findAndRegisterModules(), settings, (java.nio.file.Path) null),
+                nextHandExecutor, nextHandDelayMillis);
+    }
+
+    private TableService(SimpMessagingTemplate messaging, PokerSettings settings, AccountService accounts,
+                         ScheduledExecutorService nextHandExecutor, long nextHandDelayMillis) {
+        this.messaging = messaging;
+        this.settings = settings;
+        this.accounts = accounts;
+        this.nextHandExecutor = nextHandExecutor;
+        this.nextHandDelayMillis = nextHandDelayMillis;
+    }
+
+    private static ScheduledExecutorService daemonNextHandExecutor() {
+        return Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "poker-next-hand");
+            thread.setDaemon(true);
+            return thread;
+        });
+    }
+
+    @PreDestroy
+    void shutdownNextHands() {
+        pendingNextHands.clear();
+        if (nextHandExecutor != null) nextHandExecutor.shutdownNow();
     }
 
     private static PokerSettings testSettings() {
@@ -134,6 +171,7 @@ public class TableService {
             ensureAccountAvailable(identity.id());
             player = table.join(identity.id(), identity.nickname(), buyIn, identity.chips());
         }
+        scheduleNextHand(table);
         publish(tableId);
         return session(table, player);
     }
@@ -141,6 +179,34 @@ public class TableService {
     public TableViews.SessionView reconnect(UUID tableId, UUID playerId, UUID reconnectToken) {
         PokerTable table = requireTable(tableId);
         return session(table, table.authenticate(playerId, reconnectToken));
+    }
+
+    public TableViews.TableView rename(UUID tableId, UUID playerId, UUID reconnectToken, String name) {
+        PokerTable table = requireTable(tableId);
+        table.authenticate(playerId, reconnectToken);
+        table.rename(name);
+        publish(tableId);
+        return TableViews.TableView.from(table, playerId);
+    }
+
+    public void leave(UUID tableId, UUID playerId, UUID reconnectToken) {
+        PokerTable table = requireTable(tableId);
+        table.authenticate(playerId, reconnectToken);
+        PokerTable.Departure departure = table.leave(playerId);
+        lastEmotes.remove(playerId);
+        if (departure.accountId() != null) {
+            accounts.updateBalance(departure.accountId(), departure.chips());
+            if (departure.recordHand()) {
+                accounts.recordHand(departure.accountId(), new AccountService.HandResult(
+                        table.id(), table.name(), departure.handNumber(),
+                        table.privateTable() ? "AI" : "HUMAN", departure.result(),
+                        departure.netChips(), departure.chips()));
+            }
+        }
+        runAiTurns(table);
+        synchronizeAccounts(table);
+        scheduleNextHand(table);
+        publish(tableId);
     }
 
     public Optional<TableViews.SessionView> accountSeat(UUID accountId, UUID accountToken) {
@@ -190,10 +256,13 @@ public class TableService {
 
     public TableViews.TableView start(UUID tableId, UUID playerId, UUID reconnectToken) {
         PokerTable table = requireTable(tableId);
+        invalidateNextHand(tableId);
         table.authenticate(playerId, reconnectToken);
+        table.clearNextHandDeadline();
         table.start(playerId);
         runAiTurns(table);
         synchronizeAccounts(table);
+        scheduleNextHand(table);
         publish(tableId);
         return TableViews.TableView.from(table, playerId);
     }
@@ -205,6 +274,7 @@ public class TableService {
         table.act(playerId, type, raiseTo);
         runAiTurns(table);
         synchronizeAccounts(table);
+        scheduleNextHand(table);
         publish(tableId);
         return TableViews.TableView.from(table, playerId);
     }
@@ -222,6 +292,7 @@ public class TableService {
         table.authenticate(playerId, reconnectToken);
         table.topUp(playerId, amount);
         synchronizeAccounts(table);
+        scheduleNextHand(table);
         publish(tableId);
         return TableViews.TableView.from(table, playerId);
     }
@@ -231,6 +302,7 @@ public class TableService {
         table.authenticate(playerId, reconnectToken);
         table.cashOut(playerId, amount);
         synchronizeAccounts(table);
+        scheduleNextHand(table);
         publish(tableId);
         return TableViews.TableView.from(table, playerId);
     }
@@ -257,11 +329,60 @@ public class TableService {
 
     public void delete(UUID tableId) {
         PokerTable table = requireTable(tableId);
+        invalidateNextHand(tableId);
         synchronizeAccounts(table);
         table.players().forEach(player -> lastEmotes.remove(player.id()));
         tables.remove(tableId);
         versions.remove(tableId);
         messaging.convertAndSend("/topic/tables/" + tableId, new TableViews.TableEvent(tableId, -1));
+    }
+
+    private void scheduleNextHand(PokerTable table) {
+        UUID tableId = table.id();
+        if (table.phase() != GamePhase.SHOWDOWN || !table.readyForNextHand()) {
+            invalidateNextHand(tableId);
+            table.clearNextHandDeadline();
+            return;
+        }
+        if (pendingNextHands.containsKey(tableId)) return;
+
+        long token = nextHandTokens.compute(tableId, (id, current) -> current == null ? 1L : current + 1);
+        table.armNextHand(Instant.now().plusMillis(nextHandDelayMillis));
+        Runnable task = () -> beginScheduledHand(tableId, token);
+        pendingNextHands.put(tableId, task);
+        if (nextHandExecutor != null) {
+            nextHandExecutor.schedule(task, nextHandDelayMillis, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    private void invalidateNextHand(UUID tableId) {
+        nextHandTokens.compute(tableId, (id, current) -> current == null ? 1L : current + 1);
+        pendingNextHands.remove(tableId);
+    }
+
+    private void beginScheduledHand(UUID tableId, long token) {
+        if (!Objects.equals(nextHandTokens.get(tableId), token)) return;
+        PokerTable table = tables.get(tableId);
+        if (table == null) return;
+        synchronized (table) {
+            if (!Objects.equals(nextHandTokens.get(tableId), token)) return;
+            pendingNextHands.remove(tableId);
+            if (table.phase() != GamePhase.SHOWDOWN || !table.readyForNextHand()) {
+                table.clearNextHandDeadline();
+                return;
+            }
+            table.clearNextHandDeadline();
+            table.start(table.players().get(0).id());
+            runAiTurns(table);
+            synchronizeAccounts(table);
+            scheduleNextHand(table);
+        }
+        publish(tableId);
+    }
+
+    void runScheduledNextHand(UUID tableId) {
+        Runnable task = pendingNextHands.get(tableId);
+        if (task != null) task.run();
     }
 
     private void runAiTurns(PokerTable table) {
@@ -291,7 +412,8 @@ public class TableService {
         for (PlayerState player : table.players()) {
             if (player.ai() || player.accountId() == null) continue;
             accounts.updateBalance(player.accountId(), player.totalChips());
-            if (table.phase() == GamePhase.SHOWDOWN && table.handNumber() > 0) {
+            if (table.phase() == GamePhase.SHOWDOWN && table.handNumber() > 0
+                    && table.playedHand(player.id())) {
                 int netChips = player.totalChips() - table.handStartingTotal(player.id());
                 accounts.recordHand(player.accountId(), new AccountService.HandResult(
                         table.id(), table.name(), table.handNumber(),

@@ -15,7 +15,7 @@ public final class PokerTable {
     private static final int ACTION_TIME_SECONDS = 25;
 
     private final UUID id;
-    private final String name;
+    private String name;
     private final int maxPlayers;
     private final boolean privateTable;
     private final int totalChips;
@@ -38,6 +38,7 @@ public final class PokerTable {
     private long handNumber;
     private String message = "等待玩家加入";
     private Instant turnStartedAt;
+    private Instant nextHandAt;
     private final Set<UUID> showdownWinnerIds = new HashSet<>();
     private final Map<UUID, List<Card>> showdownBestCards = new HashMap<>();
     private final Map<UUID, String> handResults = new HashMap<>();
@@ -109,6 +110,22 @@ public final class PokerTable {
     public long actionDeadlineEpochMillis() {
         return turnStartedAt == null ? 0 : turnStartedAt.plusSeconds(ACTION_TIME_SECONDS).toEpochMilli();
     }
+    public synchronized long nextHandDeadlineEpochMillis() {
+        return nextHandAt == null ? 0 : nextHandAt.toEpochMilli();
+    }
+    public synchronized void armNextHand(Instant deadline) { nextHandAt = deadline; }
+    public synchronized void clearNextHandDeadline() { nextHandAt = null; }
+
+    public synchronized boolean readyForNextHand() {
+        return phase == GamePhase.SHOWDOWN && players.stream().filter(this::willPlayNextHand).count() >= 2;
+    }
+
+    private boolean willPlayNextHand(PlayerState player) {
+        if (player.chips() > 0) return true;
+        if (!player.ai() || player.reserveChips() == 0 || player.chips() >= startingChips) return false;
+        int target = Math.min(startingChips, player.chips() + player.reserveChips());
+        return target >= minBuyIn;
+    }
     public boolean showdownWinner(UUID playerId) { return showdownWinnerIds.contains(playerId); }
     public List<Card> showdownBestCards(UUID playerId) {
         return showdownBestCards.getOrDefault(playerId, List.of());
@@ -117,6 +134,7 @@ public final class PokerTable {
         PlayerState player = requirePlayer(playerId);
         return handStartingTotals.getOrDefault(playerId, player.totalChips());
     }
+    public boolean playedHand(UUID playerId) { return handStartingTotals.containsKey(playerId); }
     public String handResult(UUID playerId) {
         requirePlayer(playerId);
         return handResults.getOrDefault(playerId, "LOSS");
@@ -143,14 +161,14 @@ public final class PokerTable {
 
     public synchronized PlayerState join(String nickname, Integer buyIn) {
         PlayerState player = addPlayer(null, nickname, false, buyIn == null ? startingChips : buyIn, totalChips);
-        message = nickname + " 加入了牌桌";
+        message = joinedMessage(nickname);
         return player;
     }
 
     public synchronized PlayerState join(UUID accountId, String nickname, Integer buyIn, int bankroll) {
         int requestedBuyIn = buyIn == null ? startingChips : buyIn;
         PlayerState player = addPlayer(accountId, nickname, false, requestedBuyIn, bankroll);
-        message = nickname + " 加入了牌桌";
+        message = joinedMessage(nickname);
         return player;
     }
 
@@ -161,9 +179,12 @@ public final class PokerTable {
         return player;
     }
 
+    private String joinedMessage(String nickname) {
+        if (phase == GamePhase.WAITING || phase == GamePhase.SHOWDOWN) return nickname + " 加入了牌桌";
+        return nickname + " 已入座，本局旁观，下一局开始发牌";
+    }
+
     private PlayerState addPlayer(UUID accountId, String nickname, boolean ai, int buyIn, int bankroll) {
-        if (phase != GamePhase.WAITING && phase != GamePhase.SHOWDOWN)
-            throw new IllegalStateException("牌局进行中，暂不能加入");
         if (players.size() >= maxPlayers) throw new IllegalStateException("牌桌已满");
         if (players.stream().anyMatch(player -> player.nickname().equalsIgnoreCase(nickname)))
             throw new IllegalArgumentException("昵称已被使用");
@@ -203,6 +224,14 @@ public final class PokerTable {
         return player;
     }
 
+    public synchronized void rename(String nextName) {
+        String trimmed = nextName == null ? "" : nextName.trim();
+        if (trimmed.isBlank() || trimmed.length() > 30)
+            throw new IllegalArgumentException("牌桌名称需要 1–30 个字符");
+        name = trimmed;
+        message = "牌桌已改名为 " + trimmed;
+    }
+
     public synchronized void topUp(UUID playerId, int amount) {
         ensureBetweenHands();
         PlayerState player = requirePlayer(playerId);
@@ -223,6 +252,47 @@ public final class PokerTable {
             throw new IllegalArgumentException("回收后需保留至少 " + minBuyIn + "，或一次全部回收");
         player.cashOut(amount);
         message = player.nickname() + " 回收筹码 " + amount;
+    }
+
+    public synchronized Departure leave(UUID playerId) {
+        PlayerState player = requirePlayer(playerId);
+        if (player.ai()) throw new IllegalArgumentException("AI 玩家不能离开牌桌");
+
+        boolean liveHand = phase != GamePhase.WAITING && phase != GamePhase.SHOWDOWN;
+        if (liveHand && player.status() == PlayerStatus.ALL_IN)
+            throw new IllegalStateException("全押筹码仍在底池中，请等待本局结束后再离开");
+
+        boolean played = handStartingTotals.containsKey(player.id());
+        int startingTotal = handStartingTotals.getOrDefault(player.id(), player.totalChips());
+        long hand = handNumber;
+        if (liveHand && player.status() == PlayerStatus.ACTIVE) {
+            if (contenders().size() == 1) awardUncontested(player);
+            else foldOut(player);
+        }
+
+        String result = handResults.getOrDefault(player.id(), "LOSS");
+        int chips = player.totalChips();
+        int netChips = chips - startingTotal;
+        String nickname = player.nickname();
+        UUID accountId = player.accountId();
+        int seat = player.seat();
+
+        players.remove(player);
+        handStartingTotals.remove(player.id());
+        handResults.remove(player.id());
+        showdownWinnerIds.remove(player.id());
+        showdownBestCards.remove(player.id());
+
+        if (players.isEmpty()) {
+            resetEmptyTable();
+        } else if (liveHand && phase == GamePhase.SHOWDOWN) {
+            message = nickname + " 离开了牌桌。" + message;
+        } else {
+            message = nickname + " 离开了牌桌";
+            if (liveHand && players.stream().noneMatch(remaining -> remaining.seat() == currentTurnSeat))
+                repairTurn(seat);
+        }
+        return new Departure(accountId, chips, liveHand && played, result, netChips, hand);
     }
 
     public synchronized void start(UUID playerId) {
@@ -475,6 +545,40 @@ public final class PokerTable {
         pot = 0;
     }
 
+    private void foldOut(PlayerState player) {
+        boolean theirTurn = player.seat() == currentTurnSeat;
+        player.fold();
+        if (contenders().size() <= 1) {
+            if (contenders().size() == 1) awardUncontested(contenders().get(0));
+            else showdown();
+            return;
+        }
+        if (bettingRoundComplete()) advanceStreet();
+        else if (theirTurn) setCurrentTurnSeat(nextActionSeat(player.seat()));
+    }
+
+    private void repairTurn(int afterSeat) {
+        if (phase == GamePhase.WAITING || phase == GamePhase.SHOWDOWN) return;
+        if (bettingRoundComplete() || activePlayers().size() < 2) advanceStreet();
+        else setCurrentTurnSeat(nextActionSeat(afterSeat));
+    }
+
+    private void resetEmptyTable() {
+        phase = GamePhase.WAITING;
+        dealerSeat = -1;
+        setCurrentTurnSeat(-1);
+        pot = 0;
+        currentBet = 0;
+        minRaise = bigBlind;
+        communityCards.clear();
+        handResults.clear();
+        handStartingTotals.clear();
+        showdownWinnerIds.clear();
+        showdownBestCards.clear();
+        clearNextHandDeadline();
+        message = "等待玩家加入";
+    }
+
     private void setCurrentTurnSeat(int seat) {
         currentTurnSeat = seat;
         turnStartedAt = seat < 0 ? null : Instant.now();
@@ -544,4 +648,7 @@ public final class PokerTable {
         }
         throw new IllegalStateException("没有等待行动的玩家");
     }
+
+    public record Departure(UUID accountId, int chips, boolean recordHand,
+                            String result, int netChips, long handNumber) {}
 }

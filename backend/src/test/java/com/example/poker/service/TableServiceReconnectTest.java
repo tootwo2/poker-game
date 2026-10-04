@@ -25,4 +25,19 @@ class TableServiceReconnectTest {
         assertThatThrownBy(() -> service.get(tableId, session.playerId(), UUID.randomUUID()))
                 .hasMessageContaining("重连凭证无效");
     }
+
+    @Test
+    void renamesOnlyForTheSeatedPlayer() {
+        TableService service = new TableService(mock(SimpMessagingTemplate.class));
+        TableViews.SessionView session = service.create("周末牌局", "Alice", 2, false, 0);
+
+        TableViews.TableView renamed = service.rename(session.table().id(), session.playerId(),
+                session.reconnectToken(), " 周五夜局 ");
+
+        assertThat(renamed.name()).isEqualTo("周五夜局");
+        assertThat(service.list()).anyMatch(table -> table.name().equals("周五夜局"));
+        assertThatThrownBy(() -> service.rename(session.table().id(), session.playerId(),
+                UUID.randomUUID(), "别的名字")).hasMessageContaining("重连凭证无效");
+        assertThat(service.list()).anyMatch(table -> table.name().equals("周五夜局"));
+    }
 }

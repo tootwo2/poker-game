@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { callAmount, canAllIn, canAutoStartNextHand, canStart, minimumRaiseTo, quickRaiseTo, validRaise } from './rules'
+import { callAmount, canAllIn, canStart, minimumRaiseTo, quickRaiseTo, validRaise, waitingForNextHand } from './rules'
 
 describe('poker action rules', () => {
   const table = { phase: 'PRE_FLOP', currentBet: 40, minRaise: 20, players: [{}, {}] }
@@ -27,6 +27,12 @@ describe('poker action rules', () => {
     expect(canStart({ ...table, phase: 'WAITING' })).toBe(true)
   })
 
+  it('keeps a mid-hand arrival out until the next deal', () => {
+    expect(waitingForNextHand(table, { status: 'SITTING' })).toBe(true)
+    expect(waitingForNextHand(table, { status: 'ACTIVE' })).toBe(false)
+    expect(waitingForNextHand({ ...table, phase: 'SHOWDOWN' }, { status: 'SITTING' })).toBe(false)
+  })
+
   it('builds legal half-pot and pot-size raises', () => {
     const raiseTable = { ...table, pot: 100, bigBlind: 20 }
     expect(quickRaiseTo(raiseTable, player, 0.5)).toBe(100)
@@ -34,12 +40,5 @@ describe('poker action rules', () => {
     expect(quickRaiseTo(raiseTable, { ...player, chips: 35 }, 1)).toBeNull()
   })
 
-  it('auto-starts only a funded player in a completed private hand', () => {
-    const privateTable = { ...table, privateTable: true, phase: 'SHOWDOWN', minBuyIn: 1000,
-      players: [{ id: 'me', chips: 1000 }, { id: 'ai', chips: 0, reserveChips: 5000, ai: true }] }
-    expect(canAutoStartNextHand(privateTable, privateTable.players[0])).toBe(true)
-    expect(canAutoStartNextHand(privateTable, { ...privateTable.players[0], chips: 900 })).toBe(false)
-    expect(canAutoStartNextHand({ ...privateTable, privateTable: false }, privateTable.players[0])).toBe(false)
-  })
 })
 

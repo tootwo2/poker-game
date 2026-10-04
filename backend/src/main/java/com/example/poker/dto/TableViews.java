@@ -34,7 +34,7 @@ public final class TableViews {
                             int totalChips, int minBuyIn, int defaultBuyIn, int maxBuyIn,
                             int smallBlind, int bigBlind,
                             GamePhase phase, String phaseLabel, long handNumber, int pot, int currentBet,
-                            int minRaise, long actionDeadline, int actionTimeSeconds,
+                            int minRaise, long actionDeadline, int actionTimeSeconds, long nextHandDeadline,
                             List<Integer> pots, String message,
                             List<String> communityCards, List<PlayerView> players) {
         public static TableView from(PokerTable table, UUID viewerId) {
@@ -56,7 +56,7 @@ public final class TableViews {
                     table.smallBlind(), table.bigBlind(),
                     table.phase(), table.phase().label(), table.handNumber(), table.pot(), table.currentBet(),
                     table.minRaise(), table.actionDeadlineEpochMillis(), table.actionTimeSeconds(),
-                    table.pots(), table.message(),
+                    table.nextHandDeadlineEpochMillis(), table.pots(), table.message(),
                     table.communityCards().stream().map(Card::toString).toList(), playerViews);
         }
     }

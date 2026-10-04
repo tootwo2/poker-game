@@ -56,6 +56,18 @@ public class TableController {
         return service.reconnect(tableId, request.playerId(), request.reconnectToken());
     }
 
+    @PostMapping("/{tableId}/name")
+    public TableViews.TableView rename(@PathVariable UUID tableId,
+                                       @Valid @RequestBody Requests.RenameTable request) {
+        return service.rename(tableId, request.playerId(), request.reconnectToken(), request.tableName());
+    }
+
+    @PostMapping("/{tableId}/leave")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void leave(@PathVariable UUID tableId, @Valid @RequestBody Requests.PlayerCommand request) {
+        service.leave(tableId, request.playerId(), request.reconnectToken());
+    }
+
     @PostMapping("/{tableId}/start")
     public TableViews.TableView start(@PathVariable UUID tableId, @Valid @RequestBody Requests.PlayerCommand request) {
         return service.start(tableId, request.playerId(), request.reconnectToken());
